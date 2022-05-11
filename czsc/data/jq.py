@@ -8,18 +8,18 @@ from collections import OrderedDict
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import List
+from urllib.parse import quote
 
-from ..objects import RawBar
-from ..enum import Freq
-from .base import freq_inv
-from ..utils.kline_generator import bar_end_time
-from ..analyze import CzscTrader, KlineGenerator
-from ..signals import get_default_signals
-
+from ..objects import RawBar, Freq
+from ..utils.bar_generator import freq_end_time, BarGenerator
+from .base import freq_cn2jq
 
 url = "https://dataapi.joinquant.com/apis"
 home_path = os.path.expanduser("~")
 file_token = os.path.join(home_path, "jq.token")
+
+dt_fmt = "%Y-%m-%d %H:%M:%S"
+date_fmt = "%Y-%m-%d"
 
 # 1m, 5m, 15m, 30m, 60m, 120m, 1d, 1w, 1M
 freq_convert = {"1min": "1m", "5min": '5m', '15min': '15m',
@@ -27,6 +27,7 @@ freq_convert = {"1min": "1m", "5min": '5m', '15min': '15m',
 
 freq_map = {'1min': Freq.F1, '5min': Freq.F5, '15min': Freq.F15, '30min': Freq.F30,
             '60min': Freq.F60, 'D': Freq.D, 'W': Freq.W, 'M': Freq.M}
+
 
 def set_token(jq_mob, jq_pwd):
     """
@@ -51,8 +52,8 @@ def get_token():
 
     body = {
         "method": "get_current_token",
-        "mob": jq_mob,  # mob是申请JQData时所填写的手机号
-        "pwd": jq_pwd,  # Password为聚宽官网登录密码，新申请用户默认为手机号后6位
+        "mob": jq_mob,          # mob是申请JQData时所填写的手机号
+        "pwd": quote(jq_pwd),   # Password为聚宽官网登录密码，新申请用户默认为手机号后6位
     }
     response = requests.post(url, data=json.dumps(body))
     token = response.text
@@ -67,6 +68,7 @@ def text2df(text):
     df = pd.DataFrame(rows[1:], columns=rows[0])
     return df
 
+
 def get_query_count() -> int:
     """获取查询剩余条数
     https://dataapi.joinquant.com/docs#get_query_count---%E8%8E%B7%E5%8F%96%E6%9F%A5%E8%AF%A2%E5%89%A9%E4%BD%99%E6%9D%A1%E6%95%B0
@@ -79,6 +81,7 @@ def get_query_count() -> int:
     }
     r = requests.post(url, data=json.dumps(data))
     return int(r.text)
+
 
 def get_concepts():
     """获取概念列表
@@ -94,6 +97,7 @@ def get_concepts():
     r = requests.post(url, data=json.dumps(data))
     df = text2df(r.text)
     return df
+
 
 def get_concept_stocks(symbol, date=None):
     """获取概念成份股
@@ -113,6 +117,8 @@ def get_concept_stocks(symbol, date=None):
     """
     if not date:
         date = str(datetime.now().date())
+    else:
+        date = pd.to_datetime(date)
 
     if isinstance(date, datetime):
         date = str(date.date())
@@ -125,6 +131,7 @@ def get_concept_stocks(symbol, date=None):
     }
     r = requests.post(url, data=json.dumps(data))
     return r.text.split('\n')
+
 
 def get_index_stocks(symbol, date=None):
     """获取指数成份股
@@ -156,6 +163,7 @@ def get_index_stocks(symbol, date=None):
     }
     r = requests.post(url, data=json.dumps(data))
     return r.text.split('\n')
+
 
 def get_industry(symbol):
     """
@@ -216,6 +224,7 @@ def get_all_securities(code, date=None) -> pd.DataFrame:
     }
     r = requests.post(url, data=json.dumps(data))
     return text2df(r.text)
+
 
 def get_kline(symbol: str, end_date: [datetime, str], freq: str,
               start_date: [datetime, str] = None, count=None, fq: bool = True) -> List[RawBar]:
@@ -285,11 +294,12 @@ def get_kline(symbol: str, end_date: [datetime, str], freq: str,
                                close=round(float(row[2]), 2),
                                high=round(float(row[3]), 2),
                                low=round(float(row[4]), 2),
-                               vol=int(row[5])))
+                               vol=int(row[5]), amount=int(float(row[6]))))
+            # amount 单位：元
     if start_date:
         bars = [x for x in bars if x.dt >= start_date]
     if "min" in freq:
-        bars[-1].dt = bar_end_time(bars[-1].dt, m=int(freq.replace("min", "")))
+        bars[-1].dt = freq_end_time(bars[-1].dt, freq=freq_map[freq])
     bars = [x for x in bars if x.dt <= end_date]
     return bars
 
@@ -340,13 +350,40 @@ def get_kline_period(symbol: str, start_date: [datetime, str],
                                close=round(float(row[2]), 2),
                                high=round(float(row[3]), 2),
                                low=round(float(row[4]), 2),
-                               vol=int(row[5])))
+                               vol=int(row[5]), amount=int(float(row[6]))))
+            # amount 单位：元
     if start_date:
         bars = [x for x in bars if x.dt >= start_date]
     if "min" in freq and bars:
-        bars[-1].dt = bar_end_time(bars[-1].dt, m=int(freq.replace("min", "")))
+        bars[-1].dt = freq_end_time(bars[-1].dt, freq=freq_map[freq])
     bars = [x for x in bars if x.dt <= end_date]
     return bars
+
+
+def get_init_bg(symbol: str,
+                end_dt: [str, datetime],
+                base_freq: str,
+                freqs: List[str],
+                max_count=1000,
+                fq=True):
+    """获取 symbol 的初始化 bar generator"""
+    if isinstance(end_dt, str):
+        end_dt = pd.to_datetime(end_dt, utc=False)
+
+    delta_days = 180
+    last_day = (end_dt - timedelta(days=delta_days)).replace(hour=16, minute=0)
+
+    bg = BarGenerator(base_freq, freqs, max_count)
+    for freq in bg.bars.keys():
+        bars_ = get_kline(symbol=symbol, end_date=last_day, freq=freq_cn2jq[freq], count=max_count, fq=fq)
+        bg.init_freq_bars(freq, bars_)
+        print(f"{symbol} - {freq} - {len(bg.bars[freq])} - last_dt: {bg.bars[freq][-1].dt} - last_day: {last_day}")
+
+    bars2 = get_kline_period(symbol, last_day, end_dt, freq=freq_cn2jq[base_freq], fq=fq)
+    data = [x for x in bars2 if x.dt > last_day]
+    assert len(data) > 0
+    print(f"{symbol}: bar generator 最新时间 {bg.bars[base_freq][-1].dt.strftime(dt_fmt)}，还有{len(data)}行数据需要update")
+    return bg, data
 
 
 def get_fundamental(table: str, symbol: str, date: str, columns: str = "") -> dict:
@@ -384,6 +421,7 @@ def get_fundamental(table: str, symbol: str, date: str, columns: str = "") -> di
         return df.iloc[0].to_dict()
     except:
         return {}
+
 
 def run_query(table: str, conditions: str, columns=None, count=1):
     """模拟JQDataSDK的run_query方法
@@ -469,42 +507,4 @@ def get_share_basic(symbol):
 
     f10['msg'] = msg
     return f10
-
-
-class JqCzscTrader(CzscTrader):
-    def __init__(self, symbol, max_count=2000, end_date=None):
-        self.symbol = symbol
-        if end_date:
-            self.end_date = pd.to_datetime(end_date)
-        else:
-            self.end_date = datetime.now()
-        self.max_count = max_count
-        kg = KlineGenerator(max_count=max_count*2)
-        for freq in kg.freqs:
-            bars = get_kline(symbol, end_date=self.end_date, freq=freq_inv[freq], count=max_count)
-            kg.init_kline(freq, bars)
-        super(JqCzscTrader, self).__init__(kg, get_signals=get_default_signals, events=[])
-
-    def update_factors(self):
-        """更新K线数据到最新状态"""
-        bars = get_kline_period(symbol=self.symbol, start_date=self.end_dt, end_date=datetime.now(), freq="1min")
-        if not bars or bars[-1].dt <= self.end_dt:
-            return
-        for bar in bars:
-            self.check_operate(bar)
-
-    def forward(self, n: int = 3):
-        """向前推进N天"""
-        ed = self.end_dt + timedelta(days=n)
-        if ed > datetime.now():
-            print(f"{ed} > {datetime.now()}，无法继续推进")
-            return
-
-        bars = get_kline_period(symbol=self.symbol, start_date=self.end_dt, end_date=ed, freq="1min")
-        if not bars:
-            print(f"{self.end_dt} ~ {ed} 没有交易数据")
-            return
-
-        for bar in bars:
-            self.check_operate(bar)
 
