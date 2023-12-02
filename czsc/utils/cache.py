@@ -8,7 +8,7 @@ create_dt: 2021/7/16 11:51
 import os
 import shutil
 
-home_path = os.path.join(os.path.expanduser("~"), '.czsc')
+home_path = os.environ.get("CZSC_HOME", os.path.join(os.path.expanduser("~"), '.czsc'))
 os.makedirs(home_path, exist_ok=True)
 
 
@@ -28,5 +28,3 @@ def empty_cache_path():
     shutil.rmtree(home_path)
     os.makedirs(home_path, exist_ok=False)
     print(f"已清空缓存文件夹：{home_path}")
-
-

@@ -5,15 +5,17 @@ email: zeng_bin8888@163.com
 create_dt: 2021/6/25 18:52
 """
 import time
+import json
+import requests
 import pandas as pd
 import tushare as ts
 from deprecated import deprecated
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List
-from tqdm import tqdm
-
-from ..analyze import RawBar
-from ..enum import Freq
+from functools import partial
+from loguru import logger
+from tenacity import retry, stop_after_attempt, wait_random
+from czsc.objects import RawBar, Freq
 
 
 # 数据频度 ：支持分钟(min)/日(D)/周(W)/月(M)K线，其中1min表示1分钟（类推1/5/15/30/60分钟）。
@@ -22,27 +24,62 @@ freq_map = {Freq.F1: "1min", Freq.F5: '5min', Freq.F15: "15min", Freq.F30: '30mi
             Freq.F60: "60min", Freq.D: 'D', Freq.W: "W", Freq.M: "M"}
 freq_cn_map = {"1分钟": Freq.F1, "5分钟": Freq.F5, "15分钟": Freq.F15, "30分钟": Freq.F30,
                "60分钟": Freq.F60, "日线": Freq.D}
-exchanges = {
-    "SSE": "上交所",
-    "SZSE": "深交所",
-    "CFFEX": "中金所",
-    "SHFE": "上期所",
-    "CZCE": "郑商所",
-    "DCE": "大商所",
-    "INE": "能源",
-    "IB": "银行间",
-    "XHKG": "港交所"
-}
-
 dt_fmt = "%Y-%m-%d %H:%M:%S"
 date_fmt = "%Y%m%d"
 
+
+class TushareProApi:
+    __token = ''
+    __http_url = 'http://api.waditu.com'
+
+    def __init__(self, token, timeout=30):
+        """
+        Parameters
+        ----------
+        token: str
+            API接口TOKEN，用于用户认证
+        """
+        self.__token = token
+        self.__timeout = timeout
+
+    @retry(stop=stop_after_attempt(10), wait=wait_random(1, 5))
+    def query(self, api_name, fields='', **kwargs):
+        if api_name in ['__getstate__', '__setstate__']:
+            return pd.DataFrame()
+
+        req_params = {
+            'api_name': api_name,
+            'token': self.__token,
+            'params': kwargs,
+            'fields': fields
+        }
+
+        res = requests.post(self.__http_url, json=req_params, timeout=self.__timeout)
+        if res:
+            result = json.loads(res.text)
+            if result['code'] != 0:
+                logger.warning(f"{req_params}: {result}")
+                raise Exception(result['msg'])
+
+            data = result['data']
+            columns = data['fields']
+            items = data['items']
+            return pd.DataFrame(items, columns=columns)
+        else:
+            return pd.DataFrame()
+
+    def __getattr__(self, name):
+        return partial(self.query, name)
+
+
 try:
-    pro = ts.pro_api()
+    from tushare.util import upass
+    pro = TushareProApi(upass.get_token(), timeout=60)
 except:
     print("Tushare Pro 初始化失败")
 
 
+@deprecated(reason="统一到 ts_connector 中", version='1.0.0')
 def format_kline(kline: pd.DataFrame, freq: Freq) -> List[RawBar]:
     """Tushare K线数据转换
 
@@ -57,10 +94,10 @@ def format_kline(kline: pd.DataFrame, freq: Freq) -> List[RawBar]:
 
     for i, record in enumerate(records):
         if freq == Freq.D:
-            vol = int(record['vol']*100)
-            amount = int(record.get('amount', 0)*1000)
+            vol = int(record['vol'] * 100) if record['vol'] > 0 else 0
+            amount = int(record.get('amount', 0) * 1000)
         else:
-            vol = int(record['vol'])
+            vol = int(record['vol']) if record['vol'] > 0 else 0
             amount = int(record.get('amount', 0))
 
         # 将每一根K线转换成 RawBar 对象
@@ -107,50 +144,3 @@ def get_kline(ts_code: str,
     if bars and bars[-1].dt < pd.to_datetime(end_date) and len(bars) == 8000:
         print(f"获取K线数量达到8000根，数据获取到 {bars[-1].dt}，目标 end_date 为 {end_date}")
     return bars
-
-
-@deprecated(reason="统一到 TsDataCache 对象中", version='0.9.0')
-def get_ths_daily(ts_code='885760.TI',
-                  start_date: [datetime, str] = '20100101',
-                  end_date: [datetime, str] = '20210727') -> List[RawBar]:
-    """获取同花顺概念板块日线行情
-
-    :param ts_code: 同花顺概念板块代码
-    :param start_date: 开始日期
-    :param end_date: 结束日期
-    :return:
-    """
-    start_date = pd.to_datetime(start_date).strftime(date_fmt)
-    end_date = pd.to_datetime(end_date).strftime(date_fmt)
-    kline = pro.ths_daily(ts_code=ts_code, start_date=start_date, end_date=end_date,
-                          fields='ts_code,trade_date,open,close,high,low,vol')
-    kline = kline.sort_values('trade_date')
-    rows = kline.to_dict('records')
-
-    bars = []
-    for i, row in enumerate(rows):
-        bar = RawBar(symbol=row['ts_code'], freq=Freq.D, id=i,
-                     dt=pd.to_datetime(row['trade_date']), open=row['open'],
-                     close=row['close'], high=row['high'], low=row['low'], vol=row['vol'])
-        bars.append(bar)
-    return bars
-
-
-@deprecated(reason="统一到 TsDataCache 对象中", version='0.9.0')
-def get_ths_members(exchange="A"):
-    """获取同花顺概念板块成分股"""
-    concepts = pro.ths_index(exchange=exchange)
-    concepts = concepts.to_dict('records')
-
-    res = []
-    for concept in tqdm(concepts):
-        df = pro.ths_member(ts_code=concept['ts_code'],
-                               fields="ts_code,code,name,weight,in_date,out_date,is_new")
-        df['概念名称'] = concept['name']
-        df['概念代码'] = concept['ts_code']
-        res.append(df)
-        time.sleep(0.3)
-
-    res_df = pd.concat(res, ignore_index=True)
-    return res_df
-
